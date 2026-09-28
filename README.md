@@ -1,5 +1,12 @@
 # dsh-plugin-safe-upgrade
 
+> [!IMPORTANT]
+> **Unofficial community plugin.** It is not made, endorsed or supported by
+> DeepSeek or the DeepSeek Harness (dsh) team. It only uses dsh's public
+> plugin interface. Report problems in this repository's issues, never to the
+> dsh project. "DeepSeek" and "DeepSeek Harness" belong to their owners and are
+> used here only to say what the plugin works with.
+
 Safe config history, guarded upgrades and automatic rollback for
 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) (`dsh`).
 
@@ -290,4 +297,5 @@ The UI check test drives a real headless Chromium when one is installed.
 
 ## License
 
-MIT
+MIT. An unofficial community project, provided as-is with no warranty (see
+[LICENSE](LICENSE)). Not affiliated with DeepSeek.

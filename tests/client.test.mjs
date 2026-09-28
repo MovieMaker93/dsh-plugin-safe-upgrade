@@ -65,6 +65,7 @@ test('client registers /upgrade and /rollback with live options', async () => {
     assert.equal(typeof command.available, 'function')
     assert.equal(command.available(), true)
     assert.equal(typeof command.description, 'function')
+    assert.match(command.description(), /unofficial plugin/, 'never mistaken for a built-in dsh command')
     assert.equal(command.ui.kind, 'popupSelect')
   }
 

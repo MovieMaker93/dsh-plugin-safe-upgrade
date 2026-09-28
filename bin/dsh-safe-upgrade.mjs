@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dsh-safe-upgrade CLI.
+ * dsh-safe-upgrade CLI (unofficial community plugin; not part of dsh or DeepSeek).
  *
  *   status                         versions, guard, last jobs, known-good tags
  *   upgrade [version|latest|next]  guarded upgrade (--dry-run to only validate)

@@ -1,4 +1,6 @@
 # Safe config history, guarded upgrades and automatic rollback (dsh-plugin-safe-upgrade)
+# Unofficial community plugin: not part of dsh, not made or supported by DeepSeek.
+# Problems: https://github.com/MovieMaker93/dsh-plugin-safe-upgrade/issues
 #
 # Every option is auto-detected; override any of them from your profile's
 # cordis.patch.yml with a `- id: safe-upgrade` row (a patch replaces the whole
