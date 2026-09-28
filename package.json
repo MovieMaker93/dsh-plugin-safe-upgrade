@@ -1,0 +1,51 @@
+{
+  "name": "dsh-plugin-safe-upgrade",
+  "version": "0.1.0",
+  "description": "Safe config history, guarded upgrades and automatic rollback for DeepSeek Harness (dsh)",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "upgrade",
+    "rollback",
+    "systemd"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-safe-upgrade": "./bin/dsh-safe-upgrade.mjs"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-commands"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

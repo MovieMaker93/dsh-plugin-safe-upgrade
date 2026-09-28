@@ -1,0 +1,10 @@
+# Safe config history, guarded upgrades and automatic rollback (dsh-plugin-safe-upgrade)
+#
+# Every option is auto-detected; override any of them from your profile's
+# cordis.patch.yml with a `- id: safe-upgrade` row (a patch replaces the whole
+# config, so restate every key you want to keep).
+
+- insert:
+    - id: safe-upgrade
+      name: dsh-plugin-safe-upgrade
+      config: {}
