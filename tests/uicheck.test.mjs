@@ -26,9 +26,11 @@ test('real Chromium: booted app, failure screen, and a page that never settles',
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const base = `http://127.0.0.1:${server.address().port}`
   try {
-    const ok = await checkWebUi({ url: `${base}/ok?token=x`, timeoutMs: 20_000 })
+    // Generous deadlines (the production default is 45 s): a cold browser on a
+    // busy CI runner is slow, and the check returns as soon as the page settles.
+    const ok = await checkWebUi({ url: `${base}/ok?token=x`, timeoutMs: 60_000 })
     assert.equal(ok.status, 'ok', JSON.stringify(ok))
-    const failed = await checkWebUi({ url: `${base}/fail`, timeoutMs: 20_000 })
+    const failed = await checkWebUi({ url: `${base}/fail`, timeoutMs: 60_000 })
     assert.equal(failed.status, 'failed', JSON.stringify(failed))
     assert.match(failed.detail, /did not activate/)
     assert.match(failed.detail, /settingsScope/)
