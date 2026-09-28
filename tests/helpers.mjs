@@ -1,8 +1,14 @@
 // Test fixture: a fake dsh install + DSH_HOME, and stub `systemctl`, `npm`,
 // `systemd-run` binaries on PATH that simulate a dsh service booting.
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+// Fixtures live until the test process exits, then go (they held ~0.25 MB each, forever).
+const roots = []
+process.once('exit', () => {
+  for (const root of roots) rmSync(root, { recursive: true, force: true })
+})
 
 export const REGISTRY = 'https://registry.test'
 export const FROM = '0.1.5-rc.1'
@@ -124,6 +130,7 @@ function exe(path, text) {
  */
 export function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'dsh-safe-upgrade-'))
+  roots.push(root)
   const home = join(root, 'home')
   const install = join(root, 'share', 'dsh')
   const state = join(root, 'state')
