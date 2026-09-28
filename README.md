@@ -8,33 +8,41 @@ dsh ships release candidates often, and a single wrong row in a
 
 - **Config history.** Every edit to the files that decide whether dsh boots
   (`settings.yaml`, profile patches and manifests, agent presets, `AGENTS.md`)
-  is committed to a git repo in `$DSH_HOME` a few seconds after it happens.
-  Sessions, credentials, caches and `node_modules` are never tracked, and a
-  secret guard refuses any file that contains a literal key.
+  is committed to a git repo in `$DSH_HOME` a few seconds after it happens,
+  including profiles and preset folders created later. Sessions, credentials,
+  caches and `node_modules` are never tracked, and a secret guard refuses any
+  file that contains a literal key before it is written to git at all.
 - **Known-good boots.** After every start the plugin checks the plugin loader
-  for failed plugins and broken presets. A clean boot tags its config
-  `good-<time>` along with the dsh version it ran.
+  for failed plugins, plugins that never finish loading, and broken presets.
+  A clean boot tags its config `good-<time>` along with the dsh version it
+  ran, once per config and version.
 - **`/upgrade`.** Upgrades dsh without touching the running service until the
   last moment. The new version is installed into a side copy, every profile
-  is validated with `dsh --dump-config`, and only then does it stop dsh, swap
-  directories and start. If the new version doesn't come back healthy, the
-  previous install and config are restored automatically. Downtime is the
-  swap plus one boot (a few seconds).
+  is validated with `dsh --dump-config` in a throwaway copy of `$DSH_HOME`,
+  idleness is checked again, and only then does it stop dsh, swap directories
+  and start. If the new version doesn't come back healthy, the previous
+  install and config are restored automatically. Downtime is the swap plus
+  one boot (a few seconds).
 - **Web UI check.** After the new version boots, the real web app is loaded
   in headless Chromium. If dsh shows its "Failed to load plugins" screen, the
   upgrade rolls back. This catches browser-side plugin failures that the
   server never sees, such as a client half waiting for a service the new
   version removed.
-- **Warnings, not surprises.** Upgrades and dry runs report patches that no
-  longer match anything in the new version and errors that plugins log without
-  failing. Turn on `failOnWarnings` to treat those as failures.
-- **`/rollback`.** Go back to any known-good boot or config snapshot. When the
-  tag was recorded on another dsh version whose install copy still exists,
-  that install is swapped back too.
+- **Warnings, not surprises.** Upgrades, dry runs and rollbacks report patches
+  that no longer match anything in the new version and errors that plugins log
+  without failing. Turn on `failOnWarnings` to treat those as failures: a dry
+  run fails, an upgrade stops before dsh is touched (config warnings) or rolls
+  back (boot warnings), and a manual rollback is undone. Automatic recovery is
+  never undone by warnings.
+- **`/rollback`.** Go back to any known-good boot or config snapshot. The
+  target config is validated before dsh is stopped. When the tag was recorded
+  on another dsh version whose install copy still exists, that install is
+  swapped back too.
 - **Boot guard (optional).** A systemd drop-in validates the config before
-  every start. If dsh fails to start three times, the last known-good config
-  is restored and dsh is started again. This also catches broken hand edits,
-  not just upgrades. It runs at most once per 15 minutes, so it can't loop.
+  every start. If dsh fails to start three times, the newest known-good config
+  the machine can return to is restored and dsh is started again. This also
+  catches broken hand edits, not just upgrades. It runs at most once per 15
+  minutes, so it can't loop, and it runs as the same account as dsh.
 - **Optional Telegram alerts** for every upgrade, rollback and recovery.
 
 ## How an upgrade runs
@@ -42,15 +50,23 @@ dsh ships release candidates often, and a single wrong row in a
 ```
 /upgrade ─▶ host half (inside dsh): idle? no job running? ─▶ systemd-run a supervisor unit
                                                               │  (survives the dsh restart)
-supervisor ─▶ snapshot + tag pre-upgrade-*                    │
+supervisor ─▶ take the job lock, snapshot + tag pre-upgrade-* │
            ─▶ cp -a install → install.next-<v>, pin @deepseek-ai/* to <v>, npm install
-           ─▶ dsh --profile <each> --dump-config   (still nothing live touched)
-           ─▶ stop dsh ─▶ install → install.prev-<old>, install.next-<v> → install ─▶ start
-           ─▶ wait for HTTP + a fresh boot marker: right version, no failed plugins
+           ─▶ dsh --profile <each> --dump-config in a throwaway $DSH_HOME   (nothing live touched)
+           ─▶ still idle? (waits up to idleWaitMs for running turns)
+           ─▶ stop dsh, confirm it is down ─▶ install → install.prev-<old>, install.next-<v> → install ─▶ start
+           ─▶ wait for HTTP + a fresh boot marker: right version, no failed or stuck plugins
            ─▶ load the web UI in headless Chromium: composer, or "Failed to load plugins"?
            ─▶ collect warnings from the journal
    failure ─▶ stop ─▶ restore install.prev + pre-upgrade config ─▶ start ─▶ verify
 ```
+
+`dsh --dump-config` is not read-only: dsh 0.1.7 rewrites each profile's
+`cordis.yml`, normalizes shipped profile manifests and deletes 0.1.5 link
+projections while it composes. Validation therefore runs against a copy of the
+config files, with each profile's `node_modules` linked in read-only fashion
+(minus the projection dsh would delete), and the live `$DSH_HOME` is never
+written by a dry run or a rejected upgrade.
 
 ## Requirements
 
@@ -106,6 +122,8 @@ dsh-safe-upgrade install-guard --unit dsh [--remove]
 The CLI runs jobs in their own systemd unit and follows their log, so you can
 disconnect safely. Without a global install, run it as
 `node ~/.dsh/plugins/safe-upgrade/bin/dsh-safe-upgrade.mjs <command>`.
+`--force` skips both idle checks (when the job is requested and right before
+dsh is stopped).
 
 ## Configuration
 
@@ -133,12 +151,14 @@ key you want to keep.
 | `profiles` | all | profiles validated with `--dump-config` |
 | `healthUrl` | from `--port` | any HTTP answer except 5xx counts as up (401 is normal) |
 | `healthTimeoutMs` | 150000 | how long a new boot may take |
+| `bootTimeoutMs` | 120000 | how long plugins may stay loading before the boot counts as unhealthy |
+| `idleWaitMs` | 300000 | how long an upgrade or rollback waits for running turns before it gives up without stopping dsh |
 | `channel` | `latest` | dist-tag offered first; tags behind it are hidden |
 | `checkIntervalHours` | 6 | npm dist-tag check interval |
 | `keepPrev` | 2 | previous install copies kept for rollback |
 | `keepGoodTags` | 10 | `good-*` tags kept |
 | `snapshots` | true | auto-commit config edits |
-| `failOnWarnings` | false | roll back when the new boot logs errors |
+| `failOnWarnings` | false | treat warnings as failures (dry runs, upgrades, manual rollbacks) |
 | `uiCheck` | `auto` | `auto`: roll back on dsh's failure screen, warn if the check can't run; `true`: also roll back when it can't run; `false`: skip |
 | `chromium` | detected | path to a Chromium/Chrome binary for the UI check |
 | `uiTimeoutMs` | 45000 | how long the UI may take to show the composer |
@@ -146,20 +166,52 @@ key you want to keep.
 
 ## What is tracked
 
-The repo in `$DSH_HOME` uses a whitelist `.gitignore`. It is written only when
-the plugin creates the repo; an existing repo and `.gitignore` are adopted
-unchanged. Tracked files:
+The plugin records and restores these files only, whatever `.gitignore` says:
 
 ```
-settings.yaml  AGENTS.md  cordis.patch.yml  .agent-presets/**
+.gitignore  settings.yaml  AGENTS.md  cordis.patch.yml  .agent-presets/**
 profiles/*/{package.json,pnpm-lock.yaml,pnpm-workspace.yaml,cordis.yml,cordis.patch.yml}
 ```
+
+(`node_modules`, `*.bak*` and `*.tmp-*` are always excluded.) When the plugin
+creates the repo it writes a matching whitelist `.gitignore` so `git status`
+stays readable; an existing repo and `.gitignore` are adopted unchanged, and
+anything the owner committed outside the list is never rolled back.
+
+Snapshots never run `git add`. Each file is read once, scanned, and exactly
+those bytes are committed, so a file that looks like it holds a literal secret,
+or is over 2 MiB, keeps its last recorded version and never reaches git's
+object store. When a rollback replaces a file whose current content is not in
+history (for example one skipped for a secret), a copy goes to
+`$DSH_HOME/safe-upgrade/restore-backups/` first.
 
 ## Safety notes
 
 - Upgrades run as the user that runs dsh (often root). The HTTP routes use
   dsh's own authentication (`connection.requestRejection`). Upgrade and
   rollback return 409 while any turn is running or another job holds the lock.
+  The lock is taken atomically, so two jobs can never run at once.
+- Idleness is checked again right before dsh is stopped, since staging can
+  take minutes. dsh has no stable way for a plugin to hold new turns, so a
+  turn that starts during the `systemctl stop` call itself is still cut off.
+- If dsh cannot be stopped, the job aborts before any install or config change.
+- **dsh running as an unprivileged system unit** (`User=` set): the supervisor
+  and the boot guard's recovery run as that same account, never as root
+  (root must not execute plugin code the service account can write). That
+  account then needs permission to manage its own unit and start transient
+  `dsh-safe-upgrade-*` units, for example with a polkit rule like the one
+  below (a starting point; not tested here, where dsh runs as root). Re-run
+  `install-guard` whenever you change the unit's `User=`.
+
+  ```js
+  // /etc/polkit-1/rules.d/50-dsh-safe-upgrade.rules
+  polkit.addRule(function (action, subject) {
+    if (action.id === "org.freedesktop.systemd1.manage-units" && subject.user === "dsh") {
+      var unit = action.lookup("unit") || ""
+      if (unit === "dsh.service" || unit.indexOf("dsh-safe-upgrade-") === 0) return polkit.Result.YES
+    }
+  })
+  ```
 - Each previous install copy is the size of your dsh install (about 300 MB).
   Two are kept by default.
 - Rollback restores tracked config only. It never touches sessions,
@@ -194,12 +246,46 @@ These are what the checks are for:
 ## Development
 
 ```bash
-npm test     # node --test: engine, repo, host, client and systemd suites
+npm test                                         # unit suites: engine, repo, host, client, systemd, UI check
+scripts/install-dsh.sh latest /tmp/dsh           # a real dsh from npm, for the regression suite
+DSH_E2E_INSTALL=/tmp/dsh DSH_E2E_UPGRADE_TO=next npm run test:e2e
 ```
 
 The tests put stub `systemctl`, `npm`, `systemd-run`, `journalctl` and `dsh`
-binaries on `PATH`. They cover the real upgrade, rollback and recovery code
-paths, including failures at every stage, without touching a live service.
+binaries on `PATH`. The stub `dsh --dump-config` writes into `$DSH_HOME` the
+way 0.1.7 does, so the tests prove validation never touches the live home.
+They cover the real upgrade, rollback and recovery code paths, including
+failures at every stage (half-finished swaps, a stop that fails, concurrent
+jobs, a turn starting mid-upgrade), without touching a live service.
+
+The regression suite (`tests/e2e/`) uses no stubs. It boots a real dsh from
+npm with this plugin linked into a throwaway profile, then checks the boot
+marker, the known-good tag, the authenticated routes, the web UI in headless
+Chrome and a live config snapshot. It proves `--dump-config` validation leaves
+the live `$DSH_HOME` byte-for-byte unchanged, and dry-runs a real upgrade
+(npm pins and all) to the next dsh release.
+
+### CI/CD
+
+| Workflow | When | What |
+|---|---|---|
+| `ci.yml` | every push and PR | conventional-commit lint, syntax and package contents, unit suites on Node 22 and 24, regression suite against dsh `latest` |
+| `e2e.yml` | nightly, and on demand | regression suite against dsh `latest` (plus a dry-run upgrade to `next`) and `next`, so a dsh release that breaks the plugin is caught before you upgrade |
+| `pr-title.yml` | PRs | the PR title (the squash-merge commit) is a conventional commit |
+| `release.yml` | push to `main` | release-please keeps a release PR with the next version and changelog; merging it tags `vX.Y.Z`, publishes the GitHub release and attaches the `npm pack` tarball |
+
+Dependabot keeps the workflow actions current.
+
+### Commits and releases
+
+Commits follow [Conventional Commits](https://www.conventionalcommits.org):
+`feat:` for a new capability (minor release), `fix:` for a bug fix (patch),
+`feat!:` or a `BREAKING CHANGE:` footer for a breaking change. `docs:`, `test:`,
+`ci:`, `refactor:` and `chore:` don't cut a release by themselves. Squash-merge
+PRs so the PR title becomes the commit on `main`.
+
+Nobody edits the version or `CHANGELOG.md` by hand: release-please does both
+in its release PR.
 The UI check test drives a real headless Chromium when one is installed.
 
 ## License
