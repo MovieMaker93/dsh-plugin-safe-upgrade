@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict'
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+  existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync,
+} from 'node:fs'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
-import { JobRunner, createJob, refreshMirror } from '../lib/engine.js'
+import {
+  JobRunner, acquireLock, createJob, lockPath, refreshMirror, releaseLock,
+} from '../lib/engine.js'
 import { ConfigRepo } from '../lib/repo.js'
-import { readDshVersion, readJson } from '../lib/util.js'
+import { readDshVersion, readJson, writeJson } from '../lib/util.js'
 import { FROM, TO, fixture } from './helpers.mjs'
 
 async function runJob(fx, kind, request, contextOverrides = {}, runnerOptions = {}) {
@@ -235,4 +239,229 @@ test('refreshMirror drops dangling links and adds new scoped packages', async ()
   const result = refreshMirror(fx.home, fx.install)
   assert.deepEqual(result, { added: 1, removed: 1 })
   assert.ok(existsSync(join(mirror, '@deepseek-ai', 'dsh-new')))
+})
+
+// ── review findings ────────────────────────────────────────────────────────
+
+test('job lock: two jobs started together never both run, and the loser leaves the winner\'s lock', async () => {
+  const fx = fixture()
+  let release
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  const slowFetch = async (url, init) => {
+    await gate // hold the first job inside its critical section
+    return fx.fetchImpl(url, init)
+  }
+  const first = createJob(fx.home, 'upgrade', { target: 'latest', dryRun: true }, fx.context)
+  const second = createJob(fx.home, 'upgrade', { target: 'latest', dryRun: true }, fx.context)
+  const a = new JobRunner(readJson(first.path), first.path, { fetchImpl: slowFetch })
+  const b = new JobRunner(readJson(second.path), second.path, { fetchImpl: fx.fetchImpl })
+  const running = a.runJob()
+  await b.runJob()
+  assert.equal(b.job.status, 'failed')
+  assert.match(b.job.error, new RegExp(`job ${first.id} is already running`))
+  assert.equal(readJson(lockPath(fx.home))?.id, first.id, 'the losing job did not delete the winner\'s lock')
+  release()
+  await running
+  assert.equal(a.job.status, 'ok', JSON.stringify(a.job.steps))
+  assert.equal(existsSync(lockPath(fx.home)), false)
+})
+
+test('job lock: a lock left by a dead process is taken over, a live one is not', () => {
+  const fx = fixture()
+  writeJson(lockPath(fx.home), { id: 'crashed', pid: 2 ** 22 + 12345, at: 'x' })
+  assert.deepEqual(acquireLock(fx.home, 'next'), { acquired: true })
+  assert.equal(readJson(lockPath(fx.home)).id, 'next')
+  const busy = acquireLock(fx.home, 'third')
+  assert.equal(busy.acquired, false)
+  assert.equal(busy.holder.id, 'next')
+  releaseLock(fx.home, 'third') // not the owner: no effect
+  assert.equal(readJson(lockPath(fx.home)).id, 'next')
+  releaseLock(fx.home, 'next')
+  assert.equal(existsSync(lockPath(fx.home)), false)
+})
+
+/** A 0.1.5 link projection that dsh 0.1.7 deletes when it composes the profile. */
+function legacyProjection(fx) {
+  const web = join(fx.home, 'profiles', 'web')
+  mkdirSync(join(web, '.dsh-module-fallback', 'node_modules', 'legacy-pkg'), { recursive: true })
+  symlinkSync('../.dsh-module-fallback/node_modules/legacy-pkg', join(web, 'node_modules', 'legacy-pkg'))
+  const isLink = (path) => {
+    try {
+      return lstatSync(path).isSymbolicLink()
+    } catch {
+      return false
+    }
+  }
+  return () => ({
+    manifest: readFileSync(join(web, 'package.json'), 'utf8'),
+    rootConfig: existsSync(join(web, 'cordis.yml')),
+    link: isLink(join(web, 'node_modules', 'legacy-pkg')),
+    projection: existsSync(join(web, '.dsh-module-fallback')),
+  })
+}
+
+test('validation: a dry run composes in a throwaway home and leaves the live one untouched', async () => {
+  const fx = fixture()
+  const live = legacyProjection(fx)
+  const before = live()
+  const job = await runJob(fx, 'upgrade', { target: TO, dryRun: true })
+  assert.equal(job.status, 'ok', JSON.stringify(job, null, 2))
+  assert.deepEqual(live(), before, 'manifest, cordis.yml and legacy links unchanged')
+  const homes = fx.log('dump-homes').trim().split('\n')
+  assert.ok(homes.length > 0 && homes.every((home) => home !== fx.home), homes.join('\n'))
+  assert.deepEqual(readdirSync(join(fx.home, 'safe-upgrade')).filter((name) => name.startsWith('validate-')), [], 'validation home removed')
+  assert.ok(existsSync(join(fx.home, 'profiles', 'web', 'node_modules', 'x', 'index.js')), 'symlinked node_modules survived the cleanup')
+})
+
+test('validation: an upgrade rejected at dump-config changed nothing live', async () => {
+  const fx = fixture()
+  const live = legacyProjection(fx)
+  const before = live()
+  fx.flag('dump-fail-version', TO)
+  const job = await runJob(fx, 'upgrade', { target: TO })
+  assert.equal(job.status, 'failed')
+  assert.equal(job.failedStep, 'dump-config')
+  assert.deepEqual(live(), before)
+})
+
+test('rollback: a swap that fails half way is undone half way', async () => {
+  const fx = fixture()
+  await goodBaseline(fx)
+  assert.equal((await runJob(fx, 'upgrade', { target: TO })).status, 'ok')
+  const job = await runJob(fx, 'rollback', { ref: 'good-20260928-000000' }, { simulateFailure: 'swap' })
+  assert.equal(job.status, 'failed', JSON.stringify(job.steps))
+  assert.equal(job.failedStep, 'swap')
+  assert.match(job.note, /restored the state from before it/)
+  assert.equal(readDshVersion(fx.install), TO, 'the live install is back in place')
+  assert.equal(readDshVersion(`${fx.install}.prev-${FROM}`), FROM, 'the target install is still kept')
+  assert.equal(readFileSync(join(fx.state, 'state'), 'utf8').trim(), 'active')
+})
+
+test('upgrade: a swap that fails half way restores the previous install', async () => {
+  const fx = fixture()
+  await goodBaseline(fx)
+  const job = await runJob(fx, 'upgrade', { target: TO }, { simulateFailure: 'swap' })
+  assert.equal(job.status, 'rolled-back', JSON.stringify(job.steps))
+  assert.equal(readDshVersion(fx.install), FROM)
+  assert.deepEqual(siblingsOf(fx.install), [])
+})
+
+test('rollback: a failed stop aborts before any install or config change', async () => {
+  const fx = fixture()
+  const repo = await goodBaseline(fx)
+  writeFileSync(join(fx.home, 'settings.yaml'), 'edited: true\n')
+  await repo.snapshot('edit')
+  fx.flag('stop-fail')
+  const job = await runJob(fx, 'rollback', { ref: 'good-20260928-000000' })
+  assert.equal(job.status, 'failed', JSON.stringify(job.steps))
+  assert.equal(job.failedStep, 'stop')
+  assert.match(job.error, /could not stop dsh-test \(now active\)/)
+  assert.equal(readFileSync(join(fx.home, 'settings.yaml'), 'utf8'), 'edited: true\n', 'config untouched')
+  assert.doesNotMatch(fx.log('systemctl.log'), /\bstart dsh-test/)
+})
+
+test('upgrade: a failed stop leaves the install and config as they were', async () => {
+  const fx = fixture()
+  await goodBaseline(fx)
+  fx.flag('stop-fail')
+  const job = await runJob(fx, 'upgrade', { target: TO })
+  assert.equal(job.status, 'failed')
+  assert.equal(job.failedStep, 'stop')
+  assert.equal(readDshVersion(fx.install), FROM)
+  assert.deepEqual(siblingsOf(fx.install), [], 'staged copy discarded')
+})
+
+test('failOnWarnings: a dry run with warnings fails', async () => {
+  const fx = fixture()
+  fx.flag('dump-warn')
+  const job = await runJob(fx, 'upgrade', { target: TO, dryRun: true }, { failOnWarnings: true })
+  assert.equal(job.status, 'failed')
+  assert.equal(job.failedStep, 'warnings')
+})
+
+test('failOnWarnings: an upgrade with config warnings stops before dsh is touched', async () => {
+  const fx = fixture()
+  await goodBaseline(fx)
+  fx.flag('dump-warn')
+  const job = await runJob(fx, 'upgrade', { target: TO }, { failOnWarnings: true })
+  assert.equal(job.status, 'failed')
+  assert.equal(job.failedStep, 'warnings')
+  assert.doesNotMatch(fx.log('systemctl.log'), /\bstop\b/)
+})
+
+test('failOnWarnings: a manual rollback whose boot logs errors is undone', async () => {
+  const fx = fixture()
+  const repo = await goodBaseline(fx)
+  writeFileSync(join(fx.home, 'settings.yaml'), 'edited: true\n')
+  await repo.snapshot('edit')
+  fx.flag('journal', JOURNAL)
+  const job = await runJob(fx, 'rollback', { ref: 'good-20260928-000000' }, { failOnWarnings: true })
+  assert.equal(job.status, 'failed', JSON.stringify(job.steps))
+  assert.equal(job.failedStep, 'warnings')
+  assert.equal(readFileSync(join(fx.home, 'settings.yaml'), 'utf8'), 'edited: true\n', 'pre-rollback config is back')
+})
+
+test('failOnWarnings: automatic recovery is not undone by warnings', async () => {
+  const fx = fixture()
+  const repo = await goodBaseline(fx)
+  writeFileSync(join(fx.home, 'profiles', 'web', 'cordis.patch.yml'), '- insert:\n    - id: web-fetch-http\n')
+  await repo.snapshot('auto: profiles/web/cordis.patch.yml')
+  fx.flag('journal', JOURNAL)
+  const job = await runJob(fx, 'auto-rollback', {}, { failOnWarnings: true })
+  assert.equal(job.status, 'ok', JSON.stringify(job.steps))
+})
+
+test('idle: a turn that started during staging stops the upgrade before dsh is stopped', async () => {
+  const fx = fixture()
+  await goodBaseline(fx)
+  writeJson(join(fx.home, 'safe-upgrade', 'turns.json'), { pid: process.pid, running: [{ session: 's1', since: new Date().toISOString() }] })
+  const job = await runJob(fx, 'upgrade', { target: TO }, { idleWaitMs: 300 })
+  assert.equal(job.status, 'failed')
+  assert.equal(job.failedStep, 'idle')
+  assert.match(job.error, /1 turn\(s\) still running/)
+  assert.doesNotMatch(fx.log('systemctl.log'), /\bstop\b/)
+  assert.equal(readDshVersion(fx.install), FROM)
+  assert.deepEqual(siblingsOf(fx.install), [])
+})
+
+test('idle: the upgrade waits for a running turn to end, then proceeds', async () => {
+  const fx = fixture()
+  await goodBaseline(fx)
+  const turns = join(fx.home, 'safe-upgrade', 'turns.json')
+  const jobs = join(fx.home, 'safe-upgrade', 'jobs')
+  writeJson(turns, { pid: process.pid, running: [{ session: 's1', since: new Date().toISOString() }] })
+  // The turn ends once the supervisor has started waiting for it.
+  const ends = setInterval(() => {
+    const logs = existsSync(jobs) ? readdirSync(jobs).filter((name) => name.endsWith('.log')) : []
+    if (logs.some((name) => readFileSync(join(jobs, name), 'utf8').includes('waiting up to'))) {
+      writeJson(turns, { pid: process.pid, running: [] })
+      clearInterval(ends)
+    }
+  }, 100)
+  const job = await runJob(fx, 'upgrade', { target: TO }, { idleWaitMs: 20_000 })
+  clearInterval(ends)
+  assert.equal(job.status, 'ok', JSON.stringify(job.steps))
+  assert.ok(job.steps.find((step) => step.name === 'idle').detail.waitedMs > 0)
+})
+
+test('idle: a forced upgrade does not wait', async () => {
+  const fx = fixture()
+  await goodBaseline(fx)
+  writeJson(join(fx.home, 'safe-upgrade', 'turns.json'), { pid: process.pid, running: [{ session: 's1', since: new Date().toISOString() }] })
+  const job = await runJob(fx, 'upgrade', { target: TO, force: true }, { idleWaitMs: 300 })
+  assert.equal(job.status, 'ok', JSON.stringify(job.steps))
+})
+
+test('auto-rollback prefers a good tag it can return to over a newer one whose install is gone', async () => {
+  const fx = fixture()
+  const repo = await goodBaseline(fx) // FROM, the running version
+  await new Promise((resolve) => setTimeout(resolve, 1100)) // distinct creatordate
+  await repo.tag('good-20260928-000100', { dshVersion: '0.0.9-pruned' }) // newer, install long gone
+  writeFileSync(join(fx.home, 'profiles', 'web', 'cordis.patch.yml'), '- insert:\n    - id: web-fetch-http\n')
+  await repo.snapshot('auto: profiles/web/cordis.patch.yml')
+  const job = await runJob(fx, 'auto-rollback', {})
+  assert.equal(job.status, 'ok', JSON.stringify(job.steps))
+  assert.equal(job.report.ref, 'good-20260928-000000')
 })

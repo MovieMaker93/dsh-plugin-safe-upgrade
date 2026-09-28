@@ -17,12 +17,17 @@ case "$cmd" in
   show)
     echo "ExecStart={ path=$FAKE_INSTALL/node_modules/.bin/dsh ; argv[]=$FAKE_INSTALL/node_modules/.bin/dsh web --host 127.0.0.1 --port 3999 ; ignore_errors=no ; start_time=[n/a] }"
     echo "Environment=HOME=$HOME DSH_HOME=$FAKE_HOME"
-    echo "EnvironmentFiles="
+    # One line per EnvironmentFile=, like systemd; none by default.
+    if [ -f "$S/envfiles" ]; then sed 's/^/EnvironmentFiles=/; s/$/ (ignore_errors=no)/' "$S/envfiles"; else echo "EnvironmentFiles="; fi
+    echo "User=$(cat "$S/unit-user" 2>/dev/null)"
+    echo "Group=$(cat "$S/unit-group" 2>/dev/null)"
     echo "MainPID=4242"
     echo "ActiveState=$(cat "$S/state" 2>/dev/null || echo active)"
     ;;
   is-active) cat "$S/state" 2>/dev/null || echo active ;;
-  stop) echo inactive > "$S/state" ;;
+  stop)
+    if [ -f "$S/stop-fail" ]; then echo "Failed to stop $2.service: Access denied" >&2; exit 1; fi
+    echo inactive > "$S/state" ;;
   reset-failed|daemon-reload) : ;;
   start|restart)
     echo active > "$S/state"
@@ -74,13 +79,28 @@ cat "$FAKE_STATE_DIR/journal" 2>/dev/null
 exit 0
 `
 
-// The fake dsh launcher: only --dump-config matters to the engine.
+// The fake dsh launcher: only --dump-config matters to the engine. Like dsh
+// 0.1.7 it writes while composing: the profile's root cordis.yml, a
+// normalized manifest, and it deletes 0.1.5 link projections.
 const DSH = `#!/bin/sh
 self=$(readlink -f "$0")
 version=$(node -p "require('$(dirname "$self")/../package.json').version")
+profile=web
+prev=
+for arg in "$@"; do [ "$prev" = "--profile" ] && profile=$arg; prev=$arg; done
+P="$DSH_HOME/profiles/$profile"
+echo "$DSH_HOME" >> "$FAKE_STATE_DIR/dump-homes"
 case " $* " in
   *" --dump-config "*)
-    if [ -f "$FAKE_STATE_DIR/dump-fail" ] || { [ -f "$FAKE_STATE_DIR/dump-fail-version" ] && [ "$(cat "$FAKE_STATE_DIR/dump-fail-version")" = "$version" ]; }; then
+    # Loading the profile writes before composing can fail, as in dsh 0.1.7.
+    if [ -d "$P/.dsh-module-fallback" ]; then
+      find "$P/node_modules/" -maxdepth 1 -type l -lname '*dsh-module-fallback*' -delete
+      rm -rf "$P/.dsh-module-fallback"
+    fi
+    printf '{"name":"dsh-profile-%s","normalized":true}\\n' "$profile" > "$P/package.json"
+    printf '# root config written by dump-config\\n' > "$P/cordis.yml"
+    if [ -f "$FAKE_STATE_DIR/dump-fail" ] || { [ -f "$FAKE_STATE_DIR/dump-fail-version" ] && [ "$(cat "$FAKE_STATE_DIR/dump-fail-version")" = "$version" ]; } \\
+      || grep -q 'web-fetch-http' "$P/cordis.patch.yml" 2>/dev/null; then
       echo "error: duplicate loader entry id web-fetch-http" >&2
       exit 1
     fi
@@ -138,6 +158,9 @@ export function fixture() {
   exe(join(bin, 'systemd-run'), SYSTEMD_RUN)
   exe(join(bin, 'journalctl'), JOURNALCTL)
   writeFileSync(join(state, 'state'), 'active\n')
+  // What the host half publishes inside a running dsh: no turn running.
+  mkdirSync(join(home, 'safe-upgrade'), { recursive: true })
+  writeFileSync(join(home, 'safe-upgrade', 'turns.json'), JSON.stringify({ pid: process.pid, running: [] }))
 
   process.env.PATH = `${bin}:${process.env.PATH}`
   process.env.FAKE_STATE_DIR = state

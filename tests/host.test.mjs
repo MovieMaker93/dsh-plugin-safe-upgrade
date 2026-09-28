@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { test } from 'node:test'
@@ -154,6 +154,118 @@ test('host: a failed plugin makes the boot unhealthy and skips the good tag', as
     assert.equal(marker.healthy, false)
     assert.match(marker.failed[0], /web-fetch-http/)
     assert.equal((await new ConfigRepo(fx.home).listTags('good-')).length, 0)
+  } finally {
+    host.dispose()
+  }
+})
+
+/** Poll `fn` until it returns a truthy value or `timeoutMs` passes. */
+async function waitFor(fn, timeoutMs = 15_000, label = 'condition') {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const value = await fn()
+    if (value) return value
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`)
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  }
+}
+
+const markerOf = (fx) => readJson(join(fx.home, 'safe-upgrade', 'boot-ok.json'))
+
+test('host: a plugin still loading at the deadline makes the boot unhealthy', async () => {
+  const fx = fixture()
+  const host = fakeHost({
+    connection: { requestRejection: () => undefined },
+    loader: { entries: () => [{ id: 'slow', options: { name: 'dsh-plugin-slow' }, fiber: { state: 1 } }] },
+    agents: {},
+  })
+  apply(host.ctx, { unit: 'dsh-test-fake', installDir: fx.install, profiles: ['web'], bootTimeoutMs: 200 })
+  try {
+    const marker = await waitFor(() => markerOf(fx), 15_000, 'boot marker')
+    assert.equal(marker.healthy, false)
+    assert.deepEqual(marker.pending, ['slow (dsh-plugin-slow)'])
+    assert.equal((await new ConfigRepo(fx.home).listTags('good-')).length, 0)
+  } finally {
+    host.dispose()
+  }
+})
+
+test('host: the same config booting cleanly on a new dsh version gets its own good tag', async () => {
+  const fx = fixture()
+  const boot = async (version) => {
+    const manifest = join(fx.install, 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
+    writeFileSync(manifest, JSON.stringify({ name: '@deepseek-ai/dsh', version }))
+    const host = fakeHost({
+      connection: { requestRejection: () => undefined },
+      loader: { entries: () => [{ id: 'web', options: { name: '@deepseek-ai/dsh-web-app' }, fiber: { state: 2 } }] },
+      agents: {},
+    })
+    const since = Date.now()
+    apply(host.ctx, { unit: 'dsh-test-fake', installDir: fx.install, profiles: ['web'] })
+    await waitFor(() => {
+      const marker = markerOf(fx)
+      return marker?.dshVersion === version && Date.parse(marker.writtenAt) >= since
+    }, 15_000, `boot marker for ${version}`)
+    host.dispose()
+  }
+  await boot('0.1.5-rc.1')
+  await new Promise((resolve) => setTimeout(resolve, 1100)) // distinct creatordate
+  await boot('0.1.7-rc.2')
+  await new Promise((resolve) => setTimeout(resolve, 1100))
+  await boot('0.1.7-rc.2') // same config and version again: no new tag
+  const good = await new ConfigRepo(fx.home).listTags('good-')
+  assert.deepEqual(good.map((tag) => tag.meta.dshVersion), ['0.1.7-rc.2', '0.1.5-rc.1'])
+  assert.equal(good[0].sha, good[1].sha, 'same config commit')
+})
+
+test('host: profile and preset directories created after startup are snapshotted', async () => {
+  const fx = fixture()
+  const host = fakeHost({
+    connection: { requestRejection: () => undefined },
+    loader: { entries: () => [] },
+    agents: {},
+  })
+  apply(host.ctx, { unit: 'dsh-test-fake', installDir: fx.install, profiles: ['web'] })
+  const repo = new ConfigRepo(fx.home)
+  const committed = async (path) => {
+    const result = await repo.git(['show', `HEAD:${path}`], { allowFail: true })
+    return result.code === 0 ? result.stdout : undefined
+  }
+  try {
+    await waitFor(() => markerOf(fx), 15_000, 'boot marker') // history exists from here on
+    const profile = join(fx.home, 'profiles', 'headless')
+    mkdirSync(profile)
+    writeFileSync(join(profile, 'cordis.patch.yml'), '- id: v1\n')
+    await waitFor(async () => (await committed('profiles/headless/cordis.patch.yml')) === '- id: v1\n', 15_000, 'new profile snapshot')
+    writeFileSync(join(profile, 'cordis.patch.yml'), '- id: v2\n')
+    await waitFor(async () => (await committed('profiles/headless/cordis.patch.yml')) === '- id: v2\n', 15_000, 'edit in the new profile')
+
+    mkdirSync(join(fx.home, '.agent-presets', 'std'), { recursive: true })
+    writeFileSync(join(fx.home, '.agent-presets', 'std', 'preset.yml'), 'name: v1\n')
+    await waitFor(async () => (await committed('.agent-presets/std/preset.yml')) === 'name: v1\n', 15_000, 'new presets snapshot')
+    writeFileSync(join(fx.home, '.agent-presets', 'std', 'preset.yml'), 'name: v2\n')
+    await waitFor(async () => (await committed('.agent-presets/std/preset.yml')) === 'name: v2\n', 15_000, 'edit in the new presets dir')
+  } finally {
+    host.dispose()
+  }
+})
+
+test('host: running turns are published for the supervisor', async () => {
+  const fx = fixture()
+  const host = fakeHost({
+    connection: { requestRejection: () => undefined },
+    loader: { entries: () => [] },
+    agents: {},
+  })
+  apply(host.ctx, { unit: 'dsh-test-fake', installDir: fx.install, profiles: ['web'], snapshots: false })
+  try {
+    const turns = () => readJson(join(fx.home, 'safe-upgrade', 'turns.json'))
+    assert.equal(turns().pid, process.pid)
+    assert.deepEqual(turns().running, [])
+    host.emit('session/event', { id: 's1' }, { type: 'turn/start' })
+    assert.deepEqual(turns().running.map((turn) => turn.session), ['s1'])
+    host.emit('session/event', { id: 's1' }, { type: 'turn/end' })
+    assert.deepEqual(turns().running, [])
   } finally {
     host.dispose()
   }

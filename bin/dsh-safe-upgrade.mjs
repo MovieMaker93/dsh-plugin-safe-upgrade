@@ -11,10 +11,11 @@
  *   auto-rollback                  recovery entry point for the boot guard
  *
  * Common options: --unit <name> (default dsh), --scope system|user,
- * --install-dir <dir>, --home <DSH_HOME>, --force, --foreground.
+ * --install-dir <dir>, --home <DSH_HOME>, --foreground,
+ * --force (skip both idle checks: at request time and right before the stop).
  */
 
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -27,7 +28,7 @@ import {
   defaultScope, describeUnit, guardInstalled, installGuard, launchTransient,
 } from '../lib/systemd.js'
 import {
-  PACKAGE_ROOT, dshBin, dshHome, installDirFromBin, listProfiles, readDshVersion, readJson,
+  PACKAGE_ROOT, dshBin, dshHome, installDirFromBin, lastSessionWrite, listProfiles, readDshVersion, readJson,
   run, sleep, stateDir, tail,
 } from '../lib/util.js'
 
@@ -68,6 +69,8 @@ async function resolveContext(flags) {
     scope,
     home,
     installDir,
+    user: described.user,
+    group: described.group,
     profile: typeof flags.profile === 'string' ? flags.profile : described.profile ?? 'web',
     context: {
       home,
@@ -77,6 +80,7 @@ async function resolveContext(flags) {
       profiles: saved.profiles ?? listProfiles(home),
       healthUrl: saved.healthUrl ?? healthUrlFromArgv(described.argv) ?? 'http://127.0.0.1:3080/',
       healthTimeoutMs: saved.healthTimeoutMs ?? 150_000,
+      idleWaitMs: saved.idleWaitMs ?? 300_000,
       registry: saved.registry ?? DEFAULT_REGISTRY,
       keepPrev: saved.keepPrev ?? 2,
       telegram: saved.telegram,
@@ -88,34 +92,6 @@ async function resolveContext(flags) {
       simulateFailure: typeof flags['simulate-failure'] === 'string' ? flags['simulate-failure'] : undefined,
     },
   }
-}
-
-/** Newest mtime under `$DSH_HOME/sessions` (bounded walk). */
-function lastSessionWrite(home) {
-  const root = join(home, 'sessions')
-  let newest = 0
-  let visited = 0
-  const walk = (dir, depth) => {
-    if (depth > 4 || visited > 20_000) return
-    let entries = []
-    try {
-      entries = readdirSync(dir, { withFileTypes: true })
-    } catch {
-      return
-    }
-    for (const entry of entries) {
-      visited++
-      const path = join(dir, entry.name)
-      if (entry.isDirectory()) walk(path, depth + 1)
-      else {
-        try {
-          newest = Math.max(newest, statSync(path).mtimeMs)
-        } catch {}
-      }
-    }
-  }
-  walk(root, 0)
-  return newest
 }
 
 function requireIdle(home, force) {
@@ -172,7 +148,8 @@ async function main() {
   const { positional, flags } = parseArgs(process.argv.slice(2))
   const command = positional[0]
   if (command === undefined || flags.help) {
-    console.log(readFileSync(CLI_PATH, 'utf8').split('\n').slice(2, 16).map((l) => l.replace(/^ \* ?/, '')).join('\n'))
+    const header = readFileSync(CLI_PATH, 'utf8').split('\n')
+    console.log(header.slice(2, header.indexOf(' */')).map((l) => l.replace(/^ \* ?/, '')).join('\n'))
     return
   }
   const resolved = await resolveContext(flags)
@@ -187,7 +164,10 @@ async function main() {
       console.log(`dsh version: ${installDir ? readDshVersion(installDir) : '?'}`)
       console.log(`boot guard:  ${guardInstalled(unit, scope) ? 'installed' : 'not installed'}`)
       const marker = readJson(markerPath(home))
-      if (marker) console.log(`last boot:   ${marker.writtenAt} ${marker.healthy ? 'healthy' : `UNHEALTHY: ${[...marker.failed, ...marker.brokenPresets].join('; ')}`}`)
+      if (marker) {
+        const problems = [...(marker.failed ?? []), ...(marker.pending ?? []).map((p) => `${p} still loading`), ...(marker.brokenPresets ?? [])]
+        console.log(`last boot:   ${marker.writtenAt} ${marker.healthy ? 'healthy' : `UNHEALTHY: ${problems.join('; ')}`}`)
+      }
       if (repo.exists()) {
         const good = await repo.listTags('good-')
         console.log(`good tags:   ${good.slice(0, 3).map((t) => `${t.name} (dsh ${t.meta.dshVersion ?? '?'})`).join(', ') || 'none'}`)
@@ -200,7 +180,7 @@ async function main() {
       if (!installDir) fail(`cannot find the dsh install for unit ${unit}; pass --install-dir`)
       const target = positional[1] ?? 'latest'
       if (!flags['dry-run']) requireIdle(home, flags.force)
-      const job = await launchAndFollow(resolved, 'upgrade', { target, dryRun: flags['dry-run'] === true }, flags)
+      const job = await launchAndFollow(resolved, 'upgrade', { target, dryRun: flags['dry-run'] === true, force: flags.force === true }, flags)
       printJob(job)
       process.exit(job.status === 'ok' || job.status === 'noop' ? 0 : 1)
     }
@@ -209,7 +189,7 @@ async function main() {
       if (!ref) fail('usage: dsh-safe-upgrade rollback <ref>   (see `status` for good-* tags)')
       if (!installDir) fail(`cannot find the dsh install for unit ${unit}; pass --install-dir`)
       requireIdle(home, flags.force)
-      const job = await launchAndFollow(resolved, 'rollback', { ref }, flags)
+      const job = await launchAndFollow(resolved, 'rollback', { ref, force: flags.force === true }, flags)
       printJob(job)
       process.exit(job.status === 'ok' ? 0 : 1)
     }
@@ -239,7 +219,8 @@ async function main() {
     }
     case 'install-guard': {
       if (!installDir) fail(`cannot find the dsh install for unit ${unit}; pass --install-dir`)
-      const spec = { unit, scope, node: process.execPath, cli: CLI_PATH, installDir, home, profile: resolved.profile }
+      // Recovery runs as the unit's own account (see renderGuard), never as root for an unprivileged dsh.
+      const spec = { unit, scope, node: process.execPath, cli: CLI_PATH, installDir, home, profile: resolved.profile, user: resolved.user, group: resolved.group }
       if (!flags.remove) {
         const check = await run(dshBin(installDir), ['--profile', resolved.profile, '--dump-config'], {
           env: { ...process.env, DSH_HOME: home }, timeoutMs: 120_000,
@@ -250,7 +231,12 @@ async function main() {
       if (flags.remove) {
         console.log(`removed ${paths.dropinPath}${paths.kept ? ` (kept ${paths.recoverPath}: another unit is still guarded)` : ` and ${paths.recoverPath}`}`)
       } else {
-        console.log(`installed ${paths.dropinPath}\ninstalled ${paths.recoverPath}\nIt takes effect on the next (re)start of ${unit}.`)
+        console.log(`installed ${paths.dropinPath}\ninstalled ${paths.recoverPath}`)
+        if (paths.recoverDropinPath) {
+          console.log(`installed ${paths.recoverDropinPath} (recovery runs as ${resolved.user}, like ${unit})`)
+          console.log(`Recovery restarts ${unit} as ${resolved.user}: that account needs permission to manage ${unit}.service (polkit; see README).`)
+        }
+        console.log(`It takes effect on the next (re)start of ${unit}. Re-run install-guard if you change ${unit}'s User=.`)
       }
       return
     }
