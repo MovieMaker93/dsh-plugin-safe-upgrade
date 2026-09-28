@@ -29,6 +29,7 @@
     "bin",
     "cordis.patch.yml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "dsh": {
@@ -43,7 +44,8 @@
     }
   },
   "scripts": {
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "test:e2e": "node --test --test-concurrency=1 --test-timeout=900000 tests/e2e/*.test.mjs"
   },
   "engines": {
     "node": ">=22"
