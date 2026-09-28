@@ -7,12 +7,44 @@ import { ConfigRepo } from '../lib/repo.js'
 import { readDshVersion, readJson } from '../lib/util.js'
 import { FROM, TO, fixture } from './helpers.mjs'
 
-async function runJob(fx, kind, request, contextOverrides = {}) {
+async function runJob(fx, kind, request, contextOverrides = {}, runnerOptions = {}) {
   const { path } = createJob(fx.home, kind, request, { ...fx.context, ...contextOverrides })
-  const runner = new JobRunner(readJson(path), path, { fetchImpl: fx.fetchImpl })
+  const runner = new JobRunner(readJson(path), path, { fetchImpl: fx.fetchImpl, ...runnerOptions })
   await runner.runJob()
   return runner.job
 }
+
+test('upgrade: a web UI that shows dsh\'s plugin-failure screen is rolled back', async () => {
+  const fx = fixture()
+  await goodBaseline(fx)
+  fx.flag('journal', 'dsh web: http://127.0.0.1:3999/?token=abc123\n')
+  const seen = []
+  const uiChecker = async ({ url }) => {
+    seen.push(url)
+    return { status: 'failed', detail: 'web boot: 1 entry did not activate dsh-esc-stop: pending (waiting for service: settingsScope)' }
+  }
+  const job = await runJob(fx, 'upgrade', { target: TO }, { uiCheck: 'auto' }, { uiChecker })
+  assert.equal(job.status, 'rolled-back', JSON.stringify(job.steps))
+  assert.equal(job.failedStep, 'ui')
+  assert.match(job.error, /settingsScope/)
+  assert.equal(readDshVersion(fx.install), FROM)
+  assert.equal(seen[0], 'http://127.0.0.1:3999/?token=abc123', 'the fresh login token is read from the journal')
+  assert.ok(!JSON.stringify(job).includes('abc123'), 'the token never reaches the job file')
+})
+
+test('upgrade: an inconclusive UI check is a warning in auto mode, a failure when strict', async () => {
+  const fx = fixture()
+  await goodBaseline(fx)
+  const uiChecker = async () => ({ status: 'skipped', detail: 'no Chromium/Chrome binary found' })
+  const auto = await runJob(fx, 'upgrade', { target: TO }, { uiCheck: 'auto' }, { uiChecker })
+  assert.equal(auto.status, 'ok', JSON.stringify(auto.steps))
+  assert.ok(auto.warnings.some((w) => w.source === 'ui' && /skipped/.test(w.text)))
+  const fx2 = fixture()
+  await goodBaseline(fx2)
+  const strict = await runJob(fx2, 'upgrade', { target: TO }, { uiCheck: true }, { uiChecker })
+  assert.equal(strict.status, 'rolled-back')
+  assert.equal(strict.failedStep, 'ui')
+})
 
 async function goodBaseline(fx) {
   const repo = new ConfigRepo(fx.home)

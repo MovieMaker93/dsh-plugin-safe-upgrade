@@ -5,6 +5,7 @@
  *   status                         versions, guard, last jobs, known-good tags
  *   upgrade [version|latest|next]  guarded upgrade (--dry-run to only validate)
  *   rollback <ref>                 restore a good-* tag, pre-* tag or commit
+ *   check-ui                       load the web UI in headless Chromium and report
  *   precheck --profile <p>         dump-config the profile (used as ExecStartPre)
  *   install-guard [--remove]       add/remove the systemd boot guard
  *   auto-rollback                  recovery entry point for the boot guard
@@ -80,6 +81,9 @@ async function resolveContext(flags) {
       keepPrev: saved.keepPrev ?? 2,
       telegram: saved.telegram,
       failOnWarnings: saved.failOnWarnings === true,
+      uiCheck: saved.uiCheck ?? 'auto',
+      chromium: saved.chromium,
+      uiTimeoutMs: saved.uiTimeoutMs ?? 45_000,
       requireMarker: existsSync(markerPath(home)),
       simulateFailure: typeof flags['simulate-failure'] === 'string' ? flags['simulate-failure'] : undefined,
     },
@@ -168,7 +172,7 @@ async function main() {
   const { positional, flags } = parseArgs(process.argv.slice(2))
   const command = positional[0]
   if (command === undefined || flags.help) {
-    console.log(readFileSync(CLI_PATH, 'utf8').split('\n').slice(2, 15).map((l) => l.replace(/^ \* ?/, '')).join('\n'))
+    console.log(readFileSync(CLI_PATH, 'utf8').split('\n').slice(2, 16).map((l) => l.replace(/^ \* ?/, '')).join('\n'))
     return
   }
   const resolved = await resolveContext(flags)
@@ -208,6 +212,18 @@ async function main() {
       const job = await launchAndFollow(resolved, 'rollback', { ref }, flags)
       printJob(job)
       process.exit(job.status === 'ok' ? 0 : 1)
+    }
+    case 'check-ui': {
+      // Same check the upgrade runs after a boot, against the running unit.
+      const runner = new JobRunner({ id: 'check-ui', context: { ...resolved.context, uiCheck: true }, steps: [] }, join(stateDir(home), 'check-ui.json'))
+      const sinceMs = Date.now() - 7 * 24 * 3600_000 // newest login URL in the unit's journal
+      try {
+        const result = await runner.checkUi(sinceMs)
+        console.log(`web UI ok (${result.ms} ms)`)
+      } catch (error) {
+        fail(error.message)
+      }
+      return
     }
     case 'precheck': {
       if (!installDir) fail('precheck needs --install-dir')

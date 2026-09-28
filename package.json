@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-safe-upgrade",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Safe config history, guarded upgrades and automatic rollback for DeepSeek Harness (dsh)",
   "keywords": [
     "dsh-plugin",

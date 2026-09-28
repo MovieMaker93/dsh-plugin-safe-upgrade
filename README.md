@@ -20,6 +20,11 @@ dsh ships release candidates often, and a single wrong row in a
   directories and start. If the new version doesn't come back healthy, the
   previous install and config are restored automatically. Downtime is the
   swap plus one boot (a few seconds).
+- **Web UI check.** After the new version boots, the real web app is loaded
+  in headless Chromium. If dsh shows its "Failed to load plugins" screen, the
+  upgrade rolls back. This catches browser-side plugin failures that the
+  server never sees, such as a client half waiting for a service the new
+  version removed.
 - **Warnings, not surprises.** Upgrades and dry runs report patches that no
   longer match anything in the new version and errors that plugins log without
   failing. Turn on `failOnWarnings` to treat those as failures.
@@ -42,6 +47,7 @@ supervisor ─▶ snapshot + tag pre-upgrade-*                    │
            ─▶ dsh --profile <each> --dump-config   (still nothing live touched)
            ─▶ stop dsh ─▶ install → install.prev-<old>, install.next-<v> → install ─▶ start
            ─▶ wait for HTTP + a fresh boot marker: right version, no failed plugins
+           ─▶ load the web UI in headless Chromium: composer, or "Failed to load plugins"?
            ─▶ collect warnings from the journal
    failure ─▶ stop ─▶ restore install.prev + pre-upgrade config ─▶ start ─▶ verify
 ```
@@ -51,6 +57,8 @@ supervisor ─▶ snapshot + tag pre-upgrade-*                    │
 - dsh 0.1.5 or later, installed with npm (the folder whose `node_modules`
   holds `@deepseek-ai/dsh`), running as a **systemd service** (system or user).
 - Linux with `git`, `npm`, `cp` and `systemd-run`. Node 22 or later.
+- Optional: Chromium or Chrome for the web UI check. Without it the check is
+  skipped and reported as a warning.
 - The plugin needs no dependencies of its own.
 
 Config history and the boot health check also work without systemd. Upgrades
@@ -91,6 +99,7 @@ dsh-safe-upgrade status
 dsh-safe-upgrade upgrade latest --dry-run
 dsh-safe-upgrade upgrade 0.1.7-rc.2
 dsh-safe-upgrade rollback good-20260928-190522
+dsh-safe-upgrade check-ui        # does the web UI actually load right now?
 dsh-safe-upgrade install-guard --unit dsh [--remove]
 ```
 
@@ -130,6 +139,9 @@ key you want to keep.
 | `keepGoodTags` | 10 | `good-*` tags kept |
 | `snapshots` | true | auto-commit config edits |
 | `failOnWarnings` | false | roll back when the new boot logs errors |
+| `uiCheck` | `auto` | `auto`: roll back on dsh's failure screen, warn if the check can't run; `true`: also roll back when it can't run; `false`: skip |
+| `chromium` | detected | path to a Chromium/Chrome binary for the UI check |
+| `uiTimeoutMs` | 45000 | how long the UI may take to show the composer |
 | `telegram` | off | `{envFile?, tokenVar?, chatVar?}` |
 
 ## What is tracked
@@ -156,16 +168,28 @@ profiles/*/{package.json,pnpm-lock.yaml,pnpm-workspace.yaml,cordis.yml,cordis.pa
 - `testing: true` enables fault injection (`simulateFailure`) through the API.
   Leave it off in production.
 
-## Found while testing 0.1.5-rc.1 → 0.1.7-rc.2
+## Found while upgrading a real install from 0.1.5-rc.1 to 0.1.7-rc.2
 
-These are real examples of what the warnings catch:
+These are what the checks are for:
 
+- **The web UI stopped loading while the server looked healthy.** Smart-DSH's
+  `dsh-esc-stop` browser half waits for the `settingsScope` service, which
+  0.1.7 removed, so the page stops at "Failed to load plugins — dsh-esc-stop:
+  pending (waiting for service: settingsScope)". Every host plugin was
+  active, so only the web UI check catches this. It was added after this
+  exact incident and verified against a real 0.1.7 instance.
 - `patch: entry "agent-presets" not found`: 0.1.7 replaced directory-based
-  agent presets with `agent-preset-registry` and `preset-*` rows, so a patch
-  that targeted `agent-presets` is silently ignored.
+  agent presets (`$DSH_HOME/.agent-presets/*`) with `agent-preset-registry`
+  and `preset-*` rows. A patch that targeted `agent-presets` is silently
+  ignored, and custom preset folders are no longer read.
 - `[esc-stop] settings registration failed TypeError: settingsCtx.settings.register is not a function`:
-  the settings API changed, and plugins built for 0.1.5 log this error
+  the host settings API changed too. Plugins built for 0.1.5 log this error
   instead of failing.
+- On first boot 0.1.7 **moves `settings.yaml` into the booted profile's
+  `cordis.patch.yml`** (keeping `settings.yaml.imported`). The config history
+  records it as one "boot: config at startup" commit, and a rollback brings
+  `settings.yaml` back. Other profiles, such as `headless`, don't get the
+  imported model providers.
 
 ## Development
 
@@ -176,6 +200,7 @@ npm test     # node --test: engine, repo, host, client and systemd suites
 The tests put stub `systemctl`, `npm`, `systemd-run`, `journalctl` and `dsh`
 binaries on `PATH`. They cover the real upgrade, rollback and recovery code
 paths, including failures at every stage, without touching a live service.
+The UI check test drives a real headless Chromium when one is installed.
 
 ## License
 

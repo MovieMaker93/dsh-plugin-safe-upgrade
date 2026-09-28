@@ -170,6 +170,7 @@ export function fixture() {
     registry: REGISTRY,
     keepPrev: 2,
     requireMarker: true,
+    uiCheck: false, // engine tests stub the UI checker explicitly where it matters
   }
 
   const flag = (name, value = '') => writeFileSync(join(state, name), value)
