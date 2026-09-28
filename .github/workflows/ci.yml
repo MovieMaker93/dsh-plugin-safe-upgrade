@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  commits:
+    name: Conventional commits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: commitlint.config.mjs
+
+  check:
+    name: Syntax and package contents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Parse every module
+        run: for file in lib/*.js lib/*.mjs bin/*.mjs tests/*.mjs tests/e2e/*.mjs; do node --check "$file"; done
+      - name: Package contents
+        run: |
+          npm pack --dry-run --json > pack.json
+          node -e '
+            const files = JSON.parse(require("fs").readFileSync("pack.json", "utf8"))[0].files.map((f) => f.path)
+            const must = ["package.json", "README.md", "LICENSE", "cordis.patch.yml", "bin/dsh-safe-upgrade.mjs", "lib/index.js", "lib/client.js", "lib/supervisor.mjs"]
+            const missing = must.filter((path) => !files.includes(path))
+            const stray = files.filter((path) => path.startsWith("tests/") || path.startsWith(".github/"))
+            if (missing.length || stray.length) { console.error({ missing, stray }); process.exit(1) }
+            console.log(`${files.length} files packed`)'
+
+  test:
+    name: Tests (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+      # The suite drives a real headless Chrome when one is installed (the runner image ships one).
+      - run: npm test
+
+  # Against the dsh users run today; the nightly run in e2e.yml also covers `next`.
+  e2e:
+    name: Regression
+    needs: test
+    uses: ./.github/workflows/e2e.yml
+    with:
+      dsh: latest

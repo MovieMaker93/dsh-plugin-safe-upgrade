@@ -1,0 +1,48 @@
+# Regression suite against a real dsh from npm: boots real dsh with this
+# plugin, checks the boot marker, known-good tag, routes and web UI, proves
+# validation never writes the live $DSH_HOME, and dry-runs a real upgrade.
+# Nightly against `latest` and `next`, so a dsh release that breaks the
+# plugin shows up before anyone upgrades to it.
+name: Regression vs real dsh
+
+on:
+  workflow_call:
+    inputs:
+      dsh:
+        description: dist-tag or version to test against (empty = latest and next)
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      dsh:
+        description: dist-tag or version to test against (empty = latest and next)
+        type: string
+        default: ''
+  schedule:
+    - cron: '17 5 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: dsh ${{ matrix.dsh }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        dsh: ${{ fromJSON(inputs.dsh && format('["{0}"]', inputs.dsh) || '["latest","next"]') }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install dsh ${{ matrix.dsh }}
+        run: scripts/install-dsh.sh "${{ matrix.dsh }}" "$RUNNER_TEMP/dsh"
+      - name: Regression suite
+        env:
+          DSH_E2E_INSTALL: ${{ runner.temp }}/dsh
+          # From the current release, dry-run the upgrade users will take next.
+          DSH_E2E_UPGRADE_TO: ${{ matrix.dsh == 'latest' && 'next' || '' }}
+        run: npm run test:e2e
