@@ -44,3 +44,13 @@ jobs:
         run: |
           npm pack
           gh release upload "$TAG" dsh-plugin-safe-upgrade-*.tgz --clobber
+      - name: Open the release notes with the unofficial-plugin notice
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+        run: |
+          notice='> **Unofficial community plugin.** Not made, endorsed or supported by DeepSeek or the DeepSeek Harness (dsh) team. Report problems in this repository, not to the dsh project.'
+          body=$(gh release view "$TAG" --json body --jq .body)
+          case "$body" in "> **Unofficial"*) exit 0 ;; esac
+          printf '%s\n\n%s\n' "$notice" "$body" > notes.md
+          gh release edit "$TAG" --notes-file notes.md
