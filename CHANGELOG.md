@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0](https://github.com/MovieMaker93/dsh-plugin-safe-upgrade/compare/v0.3.0...v0.4.0) (2026-09-29)
+
+
+### Features
+
+* **cli:** add sessions [--fix-presets] to report and repair sessions on the running dsh ([c429ba9](https://github.com/MovieMaker93/dsh-plugin-safe-upgrade/commit/c429ba9b25489352f5a29cb263ac8e496b377419))
+* keep stored sessions working across dsh upgrades ([c429ba9](https://github.com/MovieMaker93/dsh-plugin-safe-upgrade/commit/c429ba9b25489352f5a29cb263ac8e496b377419))
+* **rollback:** warn when a rollback would hide sessions continued on a newer session format ([c429ba9](https://github.com/MovieMaker93/dsh-plugin-safe-upgrade/commit/c429ba9b25489352f5a29cb263ac8e496b377419))
+* **sessions:** add legacy presets for sessions whose preset the new dsh does not define ([c429ba9](https://github.com/MovieMaker93/dsh-plugin-safe-upgrade/commit/c429ba9b25489352f5a29cb263ac8e496b377419))
+* **sessions:** open a copy of every stored session with the running and the new dsh before an upgrade ([c429ba9](https://github.com/MovieMaker93/dsh-plugin-safe-upgrade/commit/c429ba9b25489352f5a29cb263ac8e496b377419))
+* **sessions:** stop an upgrade when sessions that open today would not open afterwards ([c429ba9](https://github.com/MovieMaker93/dsh-plugin-safe-upgrade/commit/c429ba9b25489352f5a29cb263ac8e496b377419))
+
+
+### Documentation
+
+* make clear this is an unofficial community plugin ([cbcb11e](https://github.com/MovieMaker93/dsh-plugin-safe-upgrade/commit/cbcb11e94e86ddea2791fb7c3497b539835f3e4c))
+
 ## [0.3.0](https://github.com/MovieMaker93/dsh-plugin-safe-upgrade/compare/v0.2.0...v0.3.0) (2026-09-28)
 
 
