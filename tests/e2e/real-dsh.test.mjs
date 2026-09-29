@@ -20,6 +20,9 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { JobRunner, createJob, markerPath } from '../../lib/engine.js'
 import { ConfigRepo } from '../../lib/repo.js'
+import {
+  appendPatchRows, installFormatVersion, legacyPresetPatch, presetsFromDump, probeSessions,
+} from '../../lib/sessions.js'
 import { checkWebUi } from '../../lib/uicheck.js'
 import {
   PACKAGE_ROOT, PACKAGE_VERSION, dshBin, readDshVersion, readJson, run, tail,
@@ -260,6 +263,33 @@ test(`dry run: upgrading dsh ${VERSION ?? '?'} to ${UPGRADE_TO || '(unset)'} sta
     for (const warning of job.warnings ?? []) t.diagnostic(`warning (${warning.source}): ${warning.text}`)
   } finally {
     if (target) rmSync(`${INSTALL}.next-${target}`, { recursive: true, force: true })
+    rmSync(fx.root, { recursive: true, force: true })
+  }
+})
+
+test(`sessions: dsh ${VERSION ?? '?'} exposes the session store, preset rows and format the plugin reads`, { skip }, async () => {
+  const fx = await newHome()
+  try {
+    const empty = join(fx.root, 'sessions')
+    mkdirSync(empty)
+    const probe = await probeSessions(INSTALL, empty)
+    assert.equal(probe.ok, true, probe.error)
+    assert.equal(probe.listed, 0)
+    assert.ok(installFormatVersion(INSTALL) >= 1, 'SESSION_FORMAT_VERSION is readable')
+
+    const dump = await run(dshBin(INSTALL), ['--profile', 'web', '--dump-config'], { env: fx.env, cwd: fx.user })
+    assert.equal(dump.code, 0, dump.stderr)
+    const presets = presetsFromDump(dump.stdout)
+    assert.ok(presets, 'the composed web profile has an agent preset registry')
+    assert.ok(presets.defined.includes(presets.defaultId), `default ${presets.defaultId} among ${presets.defined.join(', ')}`)
+
+    // A legacy row for a retired preset composes and registers under its old ID,
+    // added to the untouched `[]` patch dsh created for the profile.
+    appendPatchRows(join(fx.profile, 'cordis.patch.yml'), legacyPresetPatch(dump.stdout, ['retired-e2e'], { dshVersion: VERSION }))
+    const composed = await run(dshBin(INSTALL), ['--profile', 'web', '--dump-config'], { env: fx.env, cwd: fx.user })
+    assert.equal(composed.code, 0, composed.stderr)
+    assert.ok(presetsFromDump(composed.stdout).defined.includes('retired-e2e'))
+  } finally {
     rmSync(fx.root, { recursive: true, force: true })
   }
 })

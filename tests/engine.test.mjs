@@ -465,3 +465,133 @@ test('auto-rollback prefers a good tag it can return to over a newer one whose i
   assert.equal(job.status, 'ok', JSON.stringify(job.steps))
   assert.equal(job.report.ref, 'good-20260928-000000')
 })
+
+// ── stored sessions across versions ──────────────────────────────────────
+
+/** A stub session probe: `after` answers for the staged target install, `before` for the running one. */
+function prober(fx, { before, after = before }) {
+  const calls = []
+  const probe = async (install, root) => {
+    calls.push({ install, root })
+    return install === fx.install ? before : after
+  }
+  return { probe, calls }
+}
+const readable = (presets, unreadable = []) => ({ ok: true, listed: 3, unreadable, presets })
+const livePatch = (fx) => readFileSync(join(fx.home, 'profiles', 'web', 'cordis.patch.yml'), 'utf8')
+
+test('sessions: a dry run plans legacy presets for presets the target lacks, and writes nothing', async () => {
+  const fx = fixture()
+  fx.flag('dump-presets')
+  fx.storeSession('session-a')
+  const before = livePatch(fx)
+  const { probe, calls } = prober(fx, { before: readable({ standard: 1, 'standard-tools': 2 }) })
+  const job = await runJob(fx, 'upgrade', { target: TO, dryRun: true }, {}, { sessionProber: probe })
+  assert.equal(job.status, 'ok', JSON.stringify(job.steps))
+  assert.deepEqual(job.report.sessions.legacyPresets, { 'standard-tools': 2 })
+  assert.equal(livePatch(fx), before)
+  assert.equal(calls.length, 2, 'the running and the staged install each open the sessions')
+  assert.ok(calls.every((call) => call.root !== join(fx.home, 'sessions')), 'probes run on a copy')
+  assert.ok(!existsSync(calls[0].root), 'the copy is removed')
+})
+
+test('sessions: an upgrade writes the legacy presets before the new version starts', async () => {
+  const fx = fixture()
+  await goodBaseline(fx)
+  fx.flag('dump-presets')
+  fx.storeSession('session-a')
+  const { probe } = prober(fx, { before: readable({ 'standard-tools': 2 }) })
+  const job = await runJob(fx, 'upgrade', { target: TO }, {}, { sessionProber: probe })
+  assert.equal(job.status, 'ok', JSON.stringify(job.steps))
+  assert.deepEqual(job.report.legacyPresets, ['standard-tools'])
+  const steps = job.steps.map((step) => step.name)
+  assert.ok(steps.indexOf('legacy-presets') > steps.indexOf('swap') && steps.indexOf('legacy-presets') < steps.indexOf('start'), steps.join(','))
+  assert.match(livePatch(fx), /# Added by dsh-safe-upgrade: legacy presets[\s\S]*- id: preset-standard-tools/)
+})
+
+test('sessions: with legacyPresets off, sessions on a vanished preset stop the upgrade before dsh is touched', async () => {
+  const fx = fixture()
+  fx.flag('dump-presets')
+  fx.storeSession('session-a')
+  const { probe } = prober(fx, { before: readable({ 'standard-tools': 2 }) })
+  const job = await runJob(fx, 'upgrade', { target: TO }, { legacyPresets: false }, { sessionProber: probe })
+  assert.equal(job.status, 'failed')
+  assert.equal(job.failedStep, 'sessions')
+  assert.match(job.error, /standard-tools \(2\).*legacyPresets is off/)
+  assert.doesNotMatch(fx.log('systemctl.log'), /\bstop\b/)
+  assert.deepEqual(siblingsOf(fx.install), [])
+})
+
+test('sessions: sessions that open today but not on the target stop the upgrade; old failures do not', async () => {
+  const fx = fixture()
+  fx.storeSession('session-a')
+  const oldChild = { id: 'child', child: true, error: 'subagent/descriptor 5 uses unsupported descriptor version 2' }
+  const regressed = { id: 'session-a', cwd: '/root/work', child: false, error: 'uses log format v9' }
+  const broken = prober(fx, { before: readable({}, [oldChild]), after: readable({}, [oldChild, regressed]) })
+  const job = await runJob(fx, 'upgrade', { target: TO }, {}, { sessionProber: broken.probe })
+  assert.equal(job.status, 'failed')
+  assert.equal(job.failedStep, 'sessions')
+  assert.match(job.error, /1 session\(s\) that open with the running dsh would not open on dsh 0\.1\.7-rc\.2, e\.g\. \/root\/work session-a: uses log format v9/)
+  assert.doesNotMatch(fx.log('systemctl.log'), /\bstop\b/)
+
+  const fx2 = fixture()
+  await goodBaseline(fx2)
+  fx2.storeSession('session-a')
+  const same = prober(fx2, { before: readable({}, [oldChild]) })
+  const ok = await runJob(fx2, 'upgrade', { target: TO, dryRun: true }, {}, { sessionProber: same.probe })
+  assert.equal(ok.status, 'ok', JSON.stringify(ok.steps))
+  assert.equal(ok.report.sessions.alreadyUnreadable, 1)
+})
+
+test('sessions: an unavailable check is a warning; sessionCheck: false skips it', async () => {
+  const fx = fixture()
+  fx.storeSession('session-a')
+  const { probe } = prober(fx, { before: readable({}), after: { ok: false, error: 'no JSONL session store' } })
+  const job = await runJob(fx, 'upgrade', { target: TO, dryRun: true }, {}, { sessionProber: probe })
+  assert.equal(job.status, 'ok', JSON.stringify(job.steps))
+  assert.ok(job.warnings.some((warning) => warning.source === 'sessions' && /unavailable.*no JSONL session store/.test(warning.text)))
+  const off = prober(fx, { before: readable({}) })
+  const skipped = await runJob(fx, 'upgrade', { target: TO, dryRun: true }, { sessionCheck: false }, { sessionProber: off.probe })
+  assert.equal(skipped.status, 'ok')
+  assert.equal(off.calls.length, 0)
+})
+
+test('sessions: a failed boot removes the legacy presets with the rest of the config', async () => {
+  const fx = fixture()
+  await goodBaseline(fx)
+  fx.flag('dump-presets')
+  fx.flag('bad-version', TO)
+  fx.storeSession('session-a')
+  const before = livePatch(fx)
+  const { probe } = prober(fx, { before: readable({ 'standard-tools': 2 }) })
+  const job = await runJob(fx, 'upgrade', { target: TO }, {}, { sessionProber: probe })
+  assert.equal(job.status, 'rolled-back', JSON.stringify(job.steps))
+  assert.ok(job.steps.some((step) => step.name === 'legacy-presets' && step.status === 'ok'))
+  assert.equal(livePatch(fx), before)
+})
+
+/** Give an install a dsh-session package that writes session format `version`. */
+function sessionFormat(install, version) {
+  const dir = join(install, 'node_modules', '@deepseek-ai', 'dsh-session')
+  mkdirSync(join(dir, 'lib'), { recursive: true })
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-session', main: 'lib/index.js' }))
+  writeFileSync(join(dir, 'lib', 'index.js'), `const SESSION_FORMAT_VERSION = ${version};\n`)
+}
+
+test('rollback: warns that sessions continued on a newer session format will not be listed', async () => {
+  const fx = fixture()
+  await goodBaseline(fx)
+  sessionFormat(fx.install, 3)
+  assert.equal((await runJob(fx, 'upgrade', { target: TO })).status, 'ok')
+  sessionFormat(fx.install, 4)
+  fx.storeSession('session-old', 'session.v3.jsonl.zstd')
+  fx.storeSession('session-continued', 'session.v4.jsonl.zstd')
+  const strict = await runJob(fx, 'rollback', { ref: 'good-20260928-000000' }, { failOnWarnings: true })
+  assert.equal(strict.status, 'failed')
+  assert.equal(strict.failedStep, 'warnings')
+  assert.match(strict.error, /1 session\(s\) use session format v4; dsh 0\.1\.5-rc\.1 reads up to v3/)
+  assert.equal(readDshVersion(fx.install), TO, 'nothing was changed')
+  const job = await runJob(fx, 'rollback', { ref: 'good-20260928-000000' })
+  assert.equal(job.status, 'ok', JSON.stringify(job.steps))
+  assert.ok(job.warnings.some((warning) => warning.source === 'sessions'))
+})

@@ -114,6 +114,15 @@ case " $* " in
       echo 'dsh: [profiles/web/cordis.patch.yml] patch: entry "agent-presets" not found' >&2
     fi
     echo "- id: web"
+    if [ -f "$FAKE_STATE_DIR/dump-presets" ]; then
+      # A preset registry, its default preset, and every preset row the profile patch inserts.
+      printf "%s\\n" "- id: agent-preset-registry" "  name: '@deepseek-ai/dsh-agent-preset-registry'" "  config:" "    default: standard" \\
+        "- id: preset-standard" "  name: '@deepseek-ai/dsh-agent-preset'" "  config:" "    id: standard" "    order: 1" \\
+        "    plugins:" "      - id: tool-fs" "        name: '@deepseek-ai/dsh-tool-fs'"
+      grep -o '^    - id: preset-[A-Za-z0-9_.-]*' "$P/cordis.patch.yml" 2>/dev/null | sed 's/.*id: preset-//' | while read -r id; do
+        printf "%s\\n" "- id: preset-$id" "  name: '@deepseek-ai/dsh-agent-preset'" "  config:" "    id: $id" "    plugins: []"
+      done
+    fi
     ;;
 esac
 exit 0
@@ -205,5 +214,10 @@ export function fixture() {
 
   const flag = (name, value = '') => writeFileSync(join(state, name), value)
   const log = (name) => (existsSync(join(state, name)) ? readFileSync(join(state, name), 'utf8') : '')
-  return { root, home, install, state, bin, context, fetchImpl, flag, log }
+  /** A stored session directory under $DSH_HOME/sessions holding one generation file. */
+  const storeSession = (session, file = 'session.v4.jsonl.zstd', project = '--root-work--') => {
+    mkdirSync(join(home, 'sessions', project, session), { recursive: true })
+    writeFileSync(join(home, 'sessions', project, session, file), '')
+  }
+  return { root, home, install, state, bin, context, fetchImpl, flag, log, storeSession }
 }

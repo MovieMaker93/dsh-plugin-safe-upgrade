@@ -30,6 +30,15 @@ dsh ships release candidates often, and a single wrong row in a
   and start. If the new version doesn't come back healthy, the previous
   install and config are restored automatically. Downtime is the swap plus
   one boot (a few seconds).
+- **Your sessions keep working.** Before any downtime, the plugin opens a
+  copy of every stored session with both the running and the new dsh. If
+  sessions that open today would not open after the upgrade, the upgrade
+  stops. If sessions were recorded under an agent preset the new version no
+  longer defines (for example a `~/.dsh/.agent-presets` folder, which 0.1.7
+  stopped reading), the plugin adds a legacy copy of the default preset under
+  the old name, so those conversations can still be continued. A rollback
+  warns when sessions continued on the newer version would disappear from an
+  older dsh.
 - **Web UI check.** After the new version boots, the real web app is loaded
   in headless Chromium. If dsh shows its "Failed to load plugins" screen, the
   upgrade rolls back. This catches browser-side plugin failures that the
@@ -60,8 +69,11 @@ dsh ships release candidates often, and a single wrong row in a
 supervisor ─▶ take the job lock, snapshot + tag pre-upgrade-* │
            ─▶ cp -a install → install.next-<v>, pin @deepseek-ai/* to <v>, npm install
            ─▶ dsh --profile <each> --dump-config in a throwaway $DSH_HOME   (nothing live touched)
+           ─▶ open a copy of every session with the old and the new dsh: none may stop opening;
+              presets the new dsh lacks get legacy copies, composed with the new version first
            ─▶ still idle? (waits up to idleWaitMs for running turns)
-           ─▶ stop dsh, confirm it is down ─▶ install → install.prev-<old>, install.next-<v> → install ─▶ start
+           ─▶ stop dsh, confirm it is down ─▶ install → install.prev-<old>, install.next-<v> → install
+           ─▶ write the legacy presets (if any) into the profile patch ─▶ start
            ─▶ wait for HTTP + a fresh boot marker: right version, no failed or stuck plugins
            ─▶ load the web UI in headless Chromium: composer, or "Failed to load plugins"?
            ─▶ collect warnings from the journal
@@ -82,6 +94,8 @@ written by a dry run or a rejected upgrade.
 - Linux with `git`, `npm`, `cp` and `systemd-run`. Node 22 or later.
 - Optional: Chromium or Chrome for the web UI check. Without it the check is
   skipped and reported as a warning.
+- The session check copies `$DSH_HOME/sessions` for the duration of the check,
+  so it needs that much free disk space next to `$DSH_HOME`.
 - The plugin needs no dependencies of its own.
 
 Config history and the boot health check also work without systemd. Upgrades
@@ -123,8 +137,15 @@ dsh-safe-upgrade upgrade latest --dry-run
 dsh-safe-upgrade upgrade 0.1.7-rc.2
 dsh-safe-upgrade rollback good-20260928-190522
 dsh-safe-upgrade check-ui        # does the web UI actually load right now?
+dsh-safe-upgrade sessions        # which sessions fail to open, and which can't be continued
+dsh-safe-upgrade sessions --fix-presets   # add legacy presets for sessions whose preset is gone
 dsh-safe-upgrade install-guard --unit dsh [--remove]
 ```
+
+`sessions` works on a copy of `$DSH_HOME/sessions` and never changes a
+session. `--fix-presets` composes the legacy presets with the running dsh
+before it appends them to the profile's `cordis.patch.yml`; a profile with
+`patchReload: live` picks them up without a restart.
 
 The CLI runs jobs in their own systemd unit and follows their log, so you can
 disconnect safely. Without a global install, run it as
@@ -169,6 +190,8 @@ key you want to keep.
 | `uiCheck` | `auto` | `auto`: roll back on dsh's failure screen, warn if the check can't run; `true`: also roll back when it can't run; `false`: skip |
 | `chromium` | detected | path to a Chromium/Chrome binary for the UI check |
 | `uiTimeoutMs` | 45000 | how long the UI may take to show the composer |
+| `sessionCheck` | `true` | open every stored session with the old and new dsh before an upgrade; `false` skips it |
+| `legacyPresets` | `true` | add legacy copies of the default preset for sessions whose preset the new dsh lacks; `false` stops the upgrade instead |
 | `telegram` | off | `{envFile?, tokenVar?, chatVar?}` |
 
 ## What is tracked
@@ -241,6 +264,17 @@ These are what the checks are for:
   agent presets (`$DSH_HOME/.agent-presets/*`) with `agent-preset-registry`
   and `preset-*` rows. A patch that targeted `agent-presets` is silently
   ignored, and custom preset folders are no longer read.
+- **Old conversations could not be continued.** A session resumes only under
+  the preset it was recorded with, so 94 sessions created with a
+  `.agent-presets/standard-tools` folder failed with `Unknown agent preset:
+  standard-tools`, and dsh refuses to switch a started session to another
+  preset. The session check and legacy presets exist for this (reported
+  upstream in [discussion #8320](https://github.com/deepseek-ai/deepseek-harness/discussions/8320)).
+- **Some subagent transcripts cannot be opened at all.** Sessions written in
+  format v0 by dsh 0.0.1-rc.1 through 0.1.1-rc.2 carry a subagent record that
+  0.1.5 and later refuse (`uses unsupported descriptor version 2`). The
+  session check reports them but does not count them against an upgrade,
+  because the running version already can't open them.
 - `[esc-stop] settings registration failed TypeError: settingsCtx.settings.register is not a function`:
   the host settings API changed too. Plugins built for 0.1.5 log this error
   instead of failing.

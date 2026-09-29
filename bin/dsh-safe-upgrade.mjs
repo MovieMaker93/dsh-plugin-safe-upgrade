@@ -6,6 +6,8 @@
  *   upgrade [version|latest|next]  guarded upgrade (--dry-run to only validate)
  *   rollback <ref>                 restore a good-* tag, pre-* tag or commit
  *   check-ui                       load the web UI in headless Chromium and report
+ *   sessions [--fix-presets]       which stored sessions fail to open or to resume;
+ *                                  --fix-presets adds legacy presets for vanished ones
  *   precheck --profile <p>         dump-config the profile (used as ExecStartPre)
  *   install-guard [--remove]       add/remove the systemd boot guard
  *   auto-rollback                  recovery entry point for the boot guard
@@ -24,6 +26,7 @@ import {
 import { healthUrlFromArgv } from '../lib/index.js'
 import { DEFAULT_REGISTRY } from '../lib/registry.js'
 import { ConfigRepo } from '../lib/repo.js'
+import { appendPatchRows, compareProbes, legacyPresetPatch, presetsFromDump, probeSessions } from '../lib/sessions.js'
 import {
   defaultScope, describeUnit, guardInstalled, installGuard, launchTransient,
 } from '../lib/systemd.js'
@@ -77,6 +80,7 @@ async function resolveContext(flags) {
       installDir,
       unit,
       scope,
+      profile: typeof flags.profile === 'string' ? flags.profile : described.profile ?? saved.profile ?? 'web',
       profiles: saved.profiles ?? listProfiles(home),
       healthUrl: saved.healthUrl ?? healthUrlFromArgv(described.argv) ?? 'http://127.0.0.1:3080/',
       healthTimeoutMs: saved.healthTimeoutMs ?? 150_000,
@@ -88,6 +92,8 @@ async function resolveContext(flags) {
       uiCheck: saved.uiCheck ?? 'auto',
       chromium: saved.chromium,
       uiTimeoutMs: saved.uiTimeoutMs ?? 45_000,
+      sessionCheck: saved.sessionCheck !== false,
+      legacyPresets: saved.legacyPresets !== false,
       requireMarker: existsSync(markerPath(home)),
       simulateFailure: typeof flags['simulate-failure'] === 'string' ? flags['simulate-failure'] : undefined,
     },
@@ -203,6 +209,54 @@ async function main() {
       } catch (error) {
         fail(error.message)
       }
+      return
+    }
+    case 'sessions': {
+      // The running install's view of the stored sessions, on a copy; --fix-presets writes config.
+      if (!installDir) fail(`cannot find the dsh install for unit ${unit}; pass --install-dir`)
+      if (!existsSync(join(home, 'sessions'))) {
+        console.log('no stored sessions')
+        return
+      }
+      const version = readDshVersion(installDir)
+      const runner = new JobRunner({ id: 'sessions', context: resolved.context, steps: [], request: {} }, join(stateDir(home), 'sessions-check.json'))
+      await runner.dumpConfigAll(installDir)
+      const profile = runner.sessionProfile()
+      const probe = await runner.withSessionCopy((root) => probeSessions(installDir, root))
+      if (!probe.ok) fail(`could not open the sessions with dsh ${version}: ${probe.error}`)
+      console.log(`dsh ${version}: ${probe.listed} session(s), ${probe.unreadable.length} fail to open`)
+      const reasons = new Map()
+      for (const row of probe.unreadable) {
+        const reason = row.error.replace(/session "[^"]+"/g, 'session').replace(/subagent\/descriptor \d+/g, 'subagent/descriptor')
+        reasons.set(reason, [...(reasons.get(reason) ?? []), row])
+      }
+      for (const [reason, rows] of reasons) {
+        const kind = rows.every((row) => row.child) ? 'subagent transcript(s)' : 'session(s)'
+        console.log(`  ${rows.length} ${kind}: ${reason}\n    e.g. ${rows[0].cwd ?? '?'} ${rows[0].id}`)
+      }
+      const presets = presetsFromDump(runner.lastDumps[profile])
+      if (presets === undefined) {
+        console.log('this dsh has no agent preset registry; presets not checked')
+        return
+      }
+      const { missingPresets } = compareProbes(probe, probe, presets.defined)
+      const missing = Object.keys(missingPresets).sort()
+      for (const [id, count] of Object.entries(probe.presets).sort()) {
+        console.log(`  preset ${id}: ${count} session(s)${missing.includes(id) ? ' — NOT DEFINED, these cannot be continued' : ''}`)
+      }
+      if (missing.length === 0) return
+      if (!flags['fix-presets']) {
+        console.log(`Run with --fix-presets to add legacy copies of the "${presets.defaultId}" preset for: ${missing.join(', ')}`)
+        process.exit(1)
+      }
+      const text = legacyPresetPatch(runner.lastDumps[profile], missing, { dshVersion: version })
+      await runner.dumpConfigAll(installDir, { extraPatch: { profile, text } })
+      const composed = presetsFromDump(runner.lastDumps[profile])?.defined ?? []
+      const absent = missing.filter((id) => !composed.includes(id))
+      if (absent.length > 0) fail(`the legacy presets did not compose: ${absent.join(', ')}; nothing was changed`)
+      appendPatchRows(join(home, 'profiles', profile, 'cordis.patch.yml'), text)
+      console.log(`added legacy presets ${missing.join(', ')} to profiles/${profile}/cordis.patch.yml`)
+      console.log(`A profile with patchReload: live picks them up now; otherwise restart ${unit}.`)
       return
     }
     case 'precheck': {
